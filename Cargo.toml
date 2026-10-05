@@ -1,0 +1,27 @@
+[package]
+name = "torznab-stream"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Torznab source plugin (JSON-RPC over stdio): search an indexer, stream tracks from torrents"
+license = "MIT"
+repository = "https://github.com/anon7627/torznab-stream"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+futures-util = "0.3"
+librqbit = { version = "9", default-features = false, features = ["rust-tls", "disable-upload"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

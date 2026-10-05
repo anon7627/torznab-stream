@@ -1,0 +1,22 @@
+# Entry for the plugin hub, to publish as plugins/torznab.toml. On a
+# release, update `version`, the URLs and the SHA-256 from the release's
+# .sha256 files.
+id = "torznab"
+name = "Torznab (unofficial)"
+description = "Search a Torznab indexer (Prowlarr, Jackett, bitmagnet…) and play music straight from BitTorrent while it downloads: releases as albums, original files bit for bit, seeking ahead, gapless preload. Covers from the torrent or Cover Art Archive, favourites in your library. You choose the indexer; use it for what you have the right to download."
+author = "anon7627"
+license = "MIT"
+repository = "https://github.com/anon7627/torznab-stream"
+version = "1.0.0"
+protocol = 1
+capabilities = ["browse", "search", "resolve", "favorites", "library"]
+
+[[assets]]
+arch = "x86_64"
+url = "https://github.com/anon7627/torznab-stream/releases/download/v1.0.0/torznab-stream-x86_64"
+sha256 = "TODO"
+
+[[assets]]
+arch = "aarch64"
+url = "https://github.com/anon7627/torznab-stream/releases/download/v1.0.0/torznab-stream-aarch64"
+sha256 = "TODO"
