@@ -25,8 +25,11 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use std::time::Duration;
+
+use axum::body::Bytes;
+use futures_util::stream;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 
 use crate::covers::Covers;
 use crate::engine::Engine;
@@ -146,14 +149,11 @@ async fn serve(
     let body = if method == Method::HEAD || length == 0 {
         Body::empty()
     } else {
-        let stream = async {
-            let h = engine.open(&id, index).await?;
-            let mut s = h.stream(index).await?;
-            s.seek(SeekFrom::Start(start)).await?;
-            anyhow::Ok(s)
-        };
-        match stream.await {
-            Ok(s) => Body::from_stream(ReaderStream::with_capacity(s.take(length), 64 * 1024)),
+        match reader_at(&engine, &id, index, start).await {
+            Ok(r) => {
+                let read = Reading { engine, id, index, pos: start, end: end + 1, reader: Some(r), failures: 0 };
+                Body::from_stream(stream::unfold(read, next_chunk))
+            }
             Err(e) => {
                 eprintln!("relay: {id}/{index}: {e:#}");
                 return (StatusCode::SERVICE_UNAVAILABLE, "torrent unavailable").into_response();
@@ -161,6 +161,81 @@ async fn serve(
         }
     };
     builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// librqbit's file stream (not a public type), positioned.
+type FileStream = std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>;
+
+async fn reader_at(engine: &Engine, id: &str, index: usize, pos: u64) -> anyhow::Result<FileStream> {
+    let h = engine.open(id, index).await?;
+    let mut s = h.stream(index).await?;
+    s.seek(SeekFrom::Start(pos)).await?;
+    Ok(Box::pin(s))
+}
+
+/// Failed reads in a row before the relay gives up on a response.
+const MAX_FAILURES: u32 = 8;
+const CHUNK: u64 = 64 * 1024;
+
+/// A response being served: the file from `pos` to `end` (exclusive).
+struct Reading {
+    engine: Arc<Engine>,
+    id: String,
+    index: usize,
+    pos: u64,
+    end: u64,
+    reader: Option<FileStream>,
+    failures: u32,
+}
+
+/// The next bytes of a response. A read that fails (the torrent changing
+/// state under it, an error librqbit recovers from) opens the file again
+/// at the same offset instead of ending the response early: a body cut
+/// short would read as a truncated file to the player.
+async fn next_chunk(mut r: Reading) -> Option<(std::io::Result<Bytes>, Reading)> {
+    if r.pos >= r.end {
+        return None;
+    }
+    loop {
+        let reader = match r.reader.as_mut() {
+            Some(reader) => Ok(reader),
+            None => match reader_at(&r.engine, &r.id, r.index, r.pos).await {
+                Ok(reader) => Ok(r.reader.insert(reader)),
+                Err(e) => Err(format!("{e:#}")),
+            },
+        };
+        let read = match reader {
+            Ok(reader) => {
+                let mut buf = vec![0u8; CHUNK.min(r.end - r.pos) as usize];
+                match reader.read(&mut buf).await {
+                    Ok(0) => Err("the file ended early".to_string()),
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Ok(buf)
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match read {
+            Ok(buf) => {
+                r.pos += buf.len() as u64;
+                r.failures = 0;
+                return Some((Ok(Bytes::from(buf)), r));
+            }
+            Err(e) => {
+                r.reader = None;
+                r.failures += 1;
+                eprintln!("relay: {}/{} at byte {}: {e} (try {} of {MAX_FAILURES})", r.id, r.index, r.pos, r.failures);
+                if r.failures >= MAX_FAILURES {
+                    r.pos = r.end;
+                    return Some((Err(std::io::Error::other(e)), r));
+                }
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(r.failures)).min(Duration::from_secs(3))).await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

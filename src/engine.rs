@@ -22,9 +22,10 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::dht::DhtPersistenceConfig;
 use librqbit::limits::LimitsConfig;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions, ManagedTorrent, Session,
-    SessionOptions,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions, ManagedTorrent,
+    ManagedTorrentState, Session, SessionOptions,
 };
+use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 
 use crate::catalog;
@@ -320,6 +321,7 @@ impl Engine {
                 (h, true)
             }
         };
+        self.restart_if_failed(id, &h).await?;
         h.wait_until_initialized().await?;
         let mut files: HashSet<usize> = h.only_files().unwrap_or_default().into_iter().collect();
         if files.insert(index) {
@@ -335,6 +337,37 @@ impl Engine {
             self.evict();
         }
         Ok(h)
+    }
+
+    /// A torrent in librqbit's error state (a storage error, most often)
+    /// serves nothing until started again.
+    async fn restart_if_failed(&self, id: &str, h: &Handle) -> Result<()> {
+        let failed = h.with_state(|s| match s {
+            ManagedTorrentState::Error(e) => Some(format!("{e:#}")),
+            _ => None,
+        });
+        if let Some(e) = failed {
+            eprintln!("{id}: the torrent stopped on an error ({e}); starting it again");
+            self.session.unpause(h).await?;
+        }
+        Ok(())
+    }
+
+    /// The running torrent of release `id`, if it was opened.
+    pub fn running(&self, id: &str) -> Option<Handle> {
+        self.handles.lock().unwrap().get(id).cloned()
+    }
+
+    /// The first bytes of file `index` of a running torrent, without
+    /// selecting the whole file: only the pieces read are fetched.
+    pub async fn head(&self, id: &str, index: usize, len: usize) -> Result<Vec<u8>> {
+        let h = self.running(id).ok_or_else(|| anyhow!("{id}: not running"))?;
+        self.restart_if_failed(id, &h).await?;
+        h.wait_until_initialized().await?;
+        let mut s = h.stream(index).await?;
+        let mut buf = vec![0u8; len];
+        s.read_exact(&mut buf).await?;
+        Ok(buf)
     }
 
     /// Bring the cache under its limit, oldest first, sparing what was

@@ -249,6 +249,9 @@ check(got.get("title") == "Aria", "item.get on a track")
 # Opening the album joined the swarm; a user takes a few seconds to press
 # play, by which time the first track is on its way.
 time.sleep(6)
+again = p.call("browse.list", {"ref": alb["ref"], "offset": 0, "limit": 50})["items"]
+lengths = [x.get("duration_ms") for x in again]
+check(lengths == [12000, 10000, 5000], "track lengths from the FLAC headers, on the next listing: " + str(lengths))
 t0 = time.time()
 r = p.call("track.resolve", {"ref": t1["ref"], "purpose": "play"})
 took = time.time() - t0

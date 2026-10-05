@@ -8,6 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::catalog;
+use crate::durations::Durations;
 use crate::engine::Meta;
 use crate::names;
 use crate::torznab::Release;
@@ -112,7 +113,7 @@ pub fn artist(name: &str) -> Value {
 
 /// The audio files of a release, in play order, as tracks. `art` is the
 /// cover's URL, if any.
-pub fn tracks(id: &str, meta: &Meta, a: &AlbumInfo, art: Option<&str>) -> Vec<Value> {
+pub fn tracks(id: &str, meta: &Meta, a: &AlbumInfo, art: Option<&str>, lengths: &Durations) -> Vec<Value> {
     // By disc, then path: leading track numbers compare as numbers.
     type Order = (u32, Vec<(u8, u64, String)>);
     let mut list: Vec<(Order, Value)> = meta
@@ -129,6 +130,7 @@ pub fn tracks(id: &str, meta: &Meta, a: &AlbumInfo, art: Option<&str>) -> Vec<Va
                 "album": a.album,
                 "album_artist": a.artist,
                 "track_no": n.track_no,
+                "duration_ms": lengths.get(id, f.index),
                 "disc_no": n.disc_no,
                 "year": a.year,
                 "art": art,
@@ -243,7 +245,11 @@ mod tests {
             ],
         );
         let a = AlbumInfo { artist: Some("Glenn Gould".into()), album: "Goldberg".into(), year: None };
-        let t = tracks("l0000000000000001", &meta, &a, Some("http://127.0.0.1:1/f/x/1/cover.jpg"));
+        let mut lengths = Durations::default();
+        lengths.set("l0000000000000001", 3, 61_000);
+        let t = tracks("l0000000000000001", &meta, &a, Some("http://127.0.0.1:1/f/x/1/cover.jpg"), &lengths);
+        assert_eq!(t[0]["duration_ms"], 61_000);
+        assert!(t[1].get("duration_ms").is_none());
         let titles: Vec<&str> = t.iter().map(|i| i["title"].as_str().unwrap()).collect();
         assert_eq!(titles, ["Aria", "Var 1", "Var 9"]);
         assert_eq!(t[0]["ref"], "t/l0000000000000001/3");

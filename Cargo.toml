@@ -1,6 +1,6 @@
 [package]
 name = "torznab-stream"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Torznab source plugin (JSON-RPC over stdio): search an indexer, stream tracks from torrents"

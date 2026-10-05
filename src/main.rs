@@ -12,6 +12,7 @@
 
 mod catalog;
 mod covers;
+mod durations;
 mod engine;
 mod favorites;
 mod items;
@@ -39,6 +40,9 @@ const PAGE: u64 = 200;
 /// How long `browse.list` waits for a release's metadata before asking the
 /// user to come back.
 const META_WAIT: Duration = Duration::from_secs(8);
+/// How long the background reading of an album's FLAC headers waits for
+/// each one.
+const HEADERS_WAIT: Duration = Duration::from_secs(120);
 /// How long `track.resolve` waits for the torrent and a FLAC header, in
 /// all: the host expects an answer within 5 s.
 const HEADER_WAIT: Duration = Duration::from_millis(4500);
@@ -280,6 +284,9 @@ struct Plugin {
     client: Client,
     catalog: Mutex<Catalog>,
     favorites: Mutex<Favorites>,
+    durations: Arc<Mutex<durations::Durations>>,
+    /// Releases whose FLAC headers are being read.
+    reading_headers: Arc<Mutex<std::collections::HashSet<String>>>,
     engine: OnceLock<Arc<Engine>>,
     relay: OnceLock<Relay>,
     out: OnceLock<Arc<Out>>,
@@ -299,6 +306,8 @@ impl Plugin {
             client: Client::new(),
             catalog: Mutex::new(Catalog::default()),
             favorites: Mutex::new(Favorites::default()),
+            durations: Arc::default(),
+            reading_headers: Arc::default(),
             engine: OnceLock::new(),
             relay: OnceLock::new(),
             out: OnceLock::new(),
@@ -333,6 +342,7 @@ impl Plugin {
         *self.settings.lock().unwrap() = settings.clone();
         *self.catalog.lock().unwrap() = Catalog::load(&data_dir);
         *self.favorites.lock().unwrap() = Favorites::load(&data_dir);
+        *self.durations.lock().unwrap() = durations::Durations::load(&data_dir);
         // Left by 0.1.0, which signed in instead of using settings.
         let _ = std::fs::remove_file(data_dir.join("indexer.json"));
         if settings.indexer.is_none() {
@@ -608,7 +618,7 @@ impl Plugin {
     async fn tracks(&self, id: &str, wait: Duration) -> Result<Vec<Value>, RpcError> {
         let (info, meta, release) = self.release_files(id, wait).await?;
         let art = self.cover_url(id, &meta, release.as_ref(), &info);
-        let tracks = items::tracks(id, &meta, &info, art.as_deref());
+        let tracks = items::tracks(id, &meta, &info, art.as_deref(), &self.durations.lock().unwrap());
         // Join the swarm now with the cover and the first track selected,
         // so that playback starts without waiting for peers. With nothing
         // left to fetch, librqbit would drop them again.
@@ -617,15 +627,41 @@ impl Plugin {
             Some(Ref::Track(_, i)) => Some(i),
             _ => None,
         });
+        // Then read the FLAC headers of the tracks whose length is not
+        // known yet: only their first pieces are fetched. The lengths show
+        // the next time the album is listed.
+        let unknown: Vec<(usize, u64)> = tracks
+            .iter()
+            .filter(|t| t.get("duration_ms").is_none() && t["format"]["codec"] == "flac")
+            .filter_map(|t| match items::parse_ref(t["ref"].as_str()?) {
+                Some(Ref::Track(_, i)) => Some((i, meta.file(i)?.len)),
+                _ => None,
+            })
+            .collect();
         if let Ok((engine, _)) = self.engine() {
             let warm: Vec<usize> = names::cover(&files).into_iter().chain(first).collect();
             let (engine, id) = (engine.clone(), id.to_string());
+            let (durations, reading) = (self.durations.clone(), self.reading_headers.clone());
             tokio::spawn(async move {
                 for i in warm {
                     if let Err(e) = engine.open(&id, i).await {
                         eprintln!("{id}: {e:#}");
                     }
                 }
+                if unknown.is_empty() || !reading.lock().unwrap().insert(id.clone()) {
+                    return;
+                }
+                for (index, len) in unknown {
+                    let head = tokio::time::timeout(HEADERS_WAIT, engine.head(&id, index, 8192.min(len as usize))).await;
+                    let Ok(Ok(buf)) = head else {
+                        eprintln!("{id}/{index}: no FLAC header yet, lengths left for later");
+                        break;
+                    };
+                    if let Some((rate, _, _, samples)) = items::streaminfo(&buf).filter(|s| s.0 > 0) {
+                        durations.lock().unwrap().set(&id, index, samples * 1000 / u64::from(rate));
+                    }
+                }
+                reading.lock().unwrap().remove(&id);
             });
         }
         Ok(tracks)
@@ -783,7 +819,9 @@ impl Plugin {
                         }
                         v["format"] = json!({"sample_rate": rate, "bits": bits, "channels": channels, "codec": "flac"});
                         if samples > 0 {
-                            v["duration_ms"] = (samples * 1000 / u64::from(rate)).into();
+                            let ms = samples * 1000 / u64::from(rate);
+                            v["duration_ms"] = ms.into();
+                            self.durations.lock().unwrap().set(id, index, ms);
                         }
                     }
                 }
