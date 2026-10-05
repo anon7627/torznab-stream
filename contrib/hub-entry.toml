@@ -14,9 +14,9 @@ capabilities = ["browse", "search", "resolve", "favorites", "library"]
 [[assets]]
 arch = "x86_64"
 url = "https://github.com/anon7627/torznab-stream/releases/download/v1.0.0/torznab-stream-x86_64"
-sha256 = "TODO"
+sha256 = "b26f0664206e20328f0984eb094c1769fab715e9a32eb129d923f57725b92e10"
 
 [[assets]]
 arch = "aarch64"
 url = "https://github.com/anon7627/torznab-stream/releases/download/v1.0.0/torznab-stream-aarch64"
-sha256 = "TODO"
+sha256 = "3792a16ddf3670affd81ab5aed4f23e444b84b606ee865541ed5dac707a0d772"
