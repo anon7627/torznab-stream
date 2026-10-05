@@ -40,6 +40,9 @@ const PAGE: u64 = 200;
 /// How long `browse.list` waits for a release's metadata before asking the
 /// user to come back.
 const META_WAIT: Duration = Duration::from_secs(8);
+/// How long a torrent may run without peers before tracks of it are
+/// refused: joining a swarm takes a few seconds (tracker, DHT).
+const SWARM_GRACE: Duration = Duration::from_secs(20);
 /// How long the background reading of an album's FLAC headers waits for
 /// each one.
 const HEADERS_WAIT: Duration = Duration::from_secs(120);
@@ -369,6 +372,7 @@ impl Plugin {
         match Engine::start(opts).await {
             Ok(e) => {
                 let e = Arc::new(e);
+                e.log_swarms();
                 let covers = Arc::new(covers::Covers::new(&opts_cache_dir));
                 match Relay::start(e.clone(), Some(covers), &data_dir).await {
                     Ok(r) => {
@@ -652,6 +656,16 @@ impl Plugin {
                     return;
                 }
                 for (index, len) in unknown {
+                    // Not while something plays: the swarm's bandwidth is
+                    // for it. Lengths also come from playing.
+                    let mut waited = Duration::ZERO;
+                    while engine.busy() && waited < Duration::from_secs(1800) {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        waited += Duration::from_secs(2);
+                    }
+                    if engine.busy() || durations.lock().unwrap().get(&id, index).is_some() {
+                        continue;
+                    }
                     let head = tokio::time::timeout(HEADERS_WAIT, engine.head(&id, index, 8192.min(len as usize))).await;
                     let Ok(Ok(buf)) = head else {
                         eprintln!("{id}/{index}: no FLAC header yet, lengths left for later");
@@ -826,10 +840,41 @@ impl Plugin {
                     }
                 }
                 Ok(Err(e)) => eprintln!("{id}/{index}: cannot read the FLAC header: {e:#}"),
-                Err(_) => eprintln!("{id}/{index}: FLAC header not there yet, format left to the engine"),
+                Err(_) => {
+                    self.no_peers(engine, id)?;
+                    eprintln!("{id}/{index}: FLAC header not there yet, format left to the engine");
+                }
             }
+        } else if handle.is_none() {
+            self.no_peers(engine, id)?;
         }
         Ok(v)
+    }
+
+    /// The file is not there yet: when the torrent has run long enough to
+    /// have met its swarm and no peer is connected, nothing will come.
+    /// Saying so here shows the user why, where an engine timeout would
+    /// only say the stream failed.
+    fn no_peers(&self, engine: &Engine, id: &str) -> Result<(), RpcError> {
+        let Some((live, seen, age)) = engine.swarm(id) else { return Ok(()) };
+        if live > 0 || age < SWARM_GRACE {
+            return Ok(());
+        }
+        eprintln!("{id}: no peer connected after {} s ({seen} heard of): refusing to play", age.as_secs());
+        Err(rpc_err(
+            -32603,
+            if seen == 0 {
+                self.t(
+                    "nobody is sharing this release right now: no peer is known for its torrent. Try again later, or pick a release with seeders.",
+                    "personne ne partage cette release en ce moment : aucun pair n'est connu pour son torrent. Réessayez plus tard, ou choisissez une release qui a des sources.",
+                )
+            } else {
+                self.t(
+                    "no peer is sending this release right now: none of the peers heard of could be reached. Try again later, or pick a release with seeders.",
+                    "aucun pair n'envoie cette release en ce moment : aucun des pairs connus n'a pu être joint. Réessayez plus tard, ou choisissez une release qui a des sources.",
+                )
+            },
+        ))
     }
 
     // ----------------------------------------------------------- dispatch

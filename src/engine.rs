@@ -109,6 +109,11 @@ pub struct Engine {
     handles: Mutex<HashMap<String, Handle>>,
     used: Mutex<HashMap<String, Instant>>,
     adding: tokio::sync::Mutex<()>,
+    /// Relay responses being served.
+    pub serving: std::sync::atomic::AtomicUsize,
+    /// When each torrent was started, to tell a swarm still being joined
+    /// from an empty one.
+    started: Mutex<HashMap<String, Instant>>,
 }
 
 impl Engine {
@@ -153,6 +158,8 @@ impl Engine {
             handles: Mutex::default(),
             used: Mutex::default(),
             adding: tokio::sync::Mutex::new(()),
+            serving: std::sync::atomic::AtomicUsize::new(0),
+            started: Mutex::default(),
         })
     }
 
@@ -318,6 +325,7 @@ impl Engine {
                 let added = self.session.add_torrent(AddTorrent::from_bytes(meta.bytes.clone()), Some(opts)).await?;
                 let h = added.into_handle().ok_or_else(|| anyhow!("the torrent was not added"))?;
                 self.handles.lock().unwrap().insert(id.to_string(), h.clone());
+                self.started.lock().unwrap().insert(id.to_string(), Instant::now());
                 (h, true)
             }
         };
@@ -351,6 +359,60 @@ impl Engine {
             self.session.unpause(h).await?;
         }
         Ok(())
+    }
+
+    /// Whether the relay is serving something now.
+    pub fn busy(&self) -> bool {
+        self.serving.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// While something plays, log every 15 s how each running torrent
+    /// fares: peers and download speed say whether the swarm keeps up.
+    pub fn log_swarms(self: &Arc<Self>) {
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let Some(me) = me.upgrade() else { return };
+                if !me.busy() {
+                    continue;
+                }
+                let handles = me.handles.lock().unwrap().clone();
+                for (id, h) in handles {
+                    let Ok(v) = serde_json::to_value(h.stats()) else { continue };
+                    let live = &v["live"];
+                    if live.is_null() {
+                        continue;
+                    }
+                    let peers = &live["snapshot"]["peer_stats"];
+                    eprintln!(
+                        "swarm {}: {} peers connected ({} known), {:.2} MiB/s down, {:.2} MiB/s up, {} of {} MB",
+                        &id[..8.min(id.len())],
+                        peers["live"].as_u64().unwrap_or(0),
+                        peers["seen"].as_u64().unwrap_or(0),
+                        live["download_speed"]["mbps"].as_f64().unwrap_or(0.0),
+                        live["upload_speed"]["mbps"].as_f64().unwrap_or(0.0),
+                        v["progress_bytes"].as_u64().unwrap_or(0) / 1_000_000,
+                        v["total_bytes"].as_u64().unwrap_or(0) / 1_000_000,
+                    );
+                }
+            }
+        });
+    }
+
+    /// How the swarm of release `id` looks: peers connected, peers heard
+    /// of, and how long the torrent has run.
+    pub fn swarm(&self, id: &str) -> Option<(u64, u64, Duration)> {
+        let age = self.started.lock().unwrap().get(id)?.elapsed();
+        let v = serde_json::to_value(self.running(id)?.stats()).ok()?;
+        let peers = &v["live"]["snapshot"]["peer_stats"];
+        Some((peers["live"].as_u64()?, peers["seen"].as_u64().unwrap_or(0), age))
+    }
+
+    /// Peers connected to the torrent of release `id`, when it runs.
+    pub fn live_peers(&self, id: &str) -> Option<u64> {
+        let stats = serde_json::to_value(self.running(id)?.stats()).ok()?;
+        stats["live"]["snapshot"]["peer_stats"]["live"].as_u64()
     }
 
     /// The running torrent of release `id`, if it was opened.

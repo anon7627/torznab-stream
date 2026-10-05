@@ -15,6 +15,8 @@ WALL_MBID = "0d4cf3a9-7d6c-3d7b-ae7a-3b8a2a0a6b1e"
 W = tempfile.mkdtemp(prefix="torznab-stream-e2e-")
 ALBUM = os.path.join(W, "share", "Glenn Gould - Goldberg Variations (1955)")
 TORRENT = os.path.join(W, "album.torrent")
+SILENT = os.path.join(W, "share", "Nobody - Silent Album (1931)")
+SILENT_TORRENT = os.path.join(W, "silent.torrent")
 # The DAC: up to 48 kHz / 24 bits.
 OUT = {"device": "hw:9,0", "bit_perfect": True, "max_rate": 48000, "max_bits": 24, "rates": [44100, 48000]}
 
@@ -33,6 +35,8 @@ ff("-f", "lavfi", "-i", "anoisesrc=d=12:a=0.3", "-ar", "44100", "-ac", "2", "-sa
 ff("-f", "lavfi", "-i", "sine=f=440:d=10", "-ar", "44100", "-ac", "2", "-sample_fmt", "s16", os.path.join(ALBUM, "02 - Variatio 1.flac"))
 ff("-f", "lavfi", "-i", "sine=f=660:d=5", "-ar", "96000", "-ac", "2", "-sample_fmt", "s32", "-bits_per_raw_sample", "24", os.path.join(ALBUM, "CD2", "01 - Hi-Res.flac"))
 ff("-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", os.path.join(ALBUM, "cover.jpg"))
+os.makedirs(SILENT)
+ff("-f", "lavfi", "-i", "anoisesrc=d=8:a=0.3", "-ar", "44100", "-ac", "2", "-sample_fmt", "s16", os.path.join(SILENT, "01 - Quiet.flac"))
 with open(os.path.join(ALBUM, "notes.txt"), "w") as f:
     f.write("not music\n")
 
@@ -60,6 +64,8 @@ def feed(port, q):
 <torznab:attr name="category" value="3040"/><torznab:attr name="seeders" value="1"/><torznab:attr name="peers" value="1"/></item>""",
         f"""<item><title>Login.Wall.1930.FLAC-GRP</title><link>http://127.0.0.1:{port}/details/wall</link>
 <enclosure url="http://127.0.0.1:{port}/dl/wall" type="application/x-bittorrent"/><torznab:attr name="seeders" value="3"/></item>""",
+        f"""<item><title>Nobody - Silent Album (1931) [FLAC]</title><link>http://127.0.0.1:{port}/details/silent</link>
+<enclosure url="http://127.0.0.1:{port}/dl/silent" type="application/x-bittorrent"/><torznab:attr name="seeders" value="2"/></item>""",
         f"""<item><title>Jane Reader - Moby Dick (Audiobook) [MP3]</title><link>http://127.0.0.1:{port}/dl/none</link>
 <category>3000</category><category>3030</category><torznab:attr name="seeders" value="4"/></item>""",
         f"""<item><title>Nobody - Seeds This (1920) [MP3]</title><link>http://127.0.0.1:{port}/dl/none</link>
@@ -117,6 +123,8 @@ class H(http.server.BaseHTTPRequestHandler):
         if u.path == "/dl/gould":
             # Like Prowlarr: the download link redirects to the file.
             self.send_response(302); self.send_header("Location", "/files/album.torrent"); self.send_header("Content-Length", "0"); self.end_headers(); return
+        if u.path == "/dl/silent":
+            return self.send(200, open(SILENT_TORRENT, "rb").read(), "application/x-bittorrent")
         if u.path == "/files/album.torrent":
             return self.send(200, open(TORRENT, "rb").read(), "application/x-bittorrent")
         self.send(404, "no")
@@ -128,6 +136,9 @@ PORT = srv.server_address[1]
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 seeder = subprocess.Popen([SEED, ALBUM, f"http://127.0.0.1:{PORT}/announce", TORRENT], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(os.path.join(W, "seed.log"), "w"), text=True)
+# A torrent whose only seeder is gone: the tracker still knows it.
+gone = subprocess.Popen([SEED, SILENT, f"http://127.0.0.1:{PORT}/announce", SILENT_TORRENT], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+gone.stdout.readline(); time.sleep(2); gone.stdin.close(); gone.wait(timeout=10)
 line = seeder.stdout.readline().strip()
 check(line.startswith("seeding "), "seeder: " + line)
 deadline = time.time() + 20
@@ -191,7 +202,7 @@ check("cat=100123" in requests[-1], "an indexer category chosen in the menu is s
 p.notify("settings.changed", {"settings": SETTINGS})
 recent = p.call("browse.list", {"ref": "recent", "offset": 0, "limit": 50})
 titles = [x["title"] for x in recent["items"]]
-check(titles == ["Goldberg Variations", "Login Wall"], "music hides audiobooks and releases without seeders: " + str(titles))
+check(titles == ["Goldberg Variations", "Login Wall", "Silent Album"], "music hides audiobooks and releases without seeders: " + str(titles))
 alb = recent["items"][0]
 check(alb["artist"] == "Glenn Gould" and alb["year"] == 1955 and alb["subtitle"].startswith("FLAC · ") and "1 source" in alb["subtitle"], "album fields: " + alb["subtitle"])
 check(not any(r.startswith("/details") for r in requests), "details pages never fetched")
@@ -280,6 +291,13 @@ check(r2.get("format", {}).get("sample_rate") == 44100, "preload of the next tra
 check(p.call("track.resolve", {"ref": alb["ref"] }).get("code") == -32002, "resolve of an album -> not_found")
 check(p.call("browse.list", {"ref": "r/" + "0" * 40, "offset": 0, "limit": 5}).get("code") is not None, "unknown release -> error")
 
+silent = [x for x in recent["items"] if x["title"] == "Silent Album"][0]
+st = p.call("browse.list", {"ref": silent["ref"], "offset": 0, "limit": 5})["items"]
+time.sleep(21)
+t0 = time.time()
+e = p.call("track.resolve", {"ref": st[0]["ref"], "purpose": "play"})
+check(e.get("code") == -32603 and "aucun pair" in e.get("message", "") and time.time() - t0 < 6,
+      "no peer for the torrent -> refused at once, with why: " + e.get("message", ""))
 check(p.call("favorites.set", {"ref": alb["ref"], "on": True}) is None, "favourite an album")
 check(p.call("favorites.set", {"ref": t1["ref"], "on": True}) is None, "favourite a track")
 la = p.call("library.albums", {"offset": 0, "limit": 50})

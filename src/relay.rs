@@ -7,6 +7,9 @@
 //!   at the requested offset first, so a seek far ahead does not wait for
 //!   the whole file.
 //! - `HEAD` answers from the metadata, without starting the download.
+//! - A `GET` answers once its first bytes are there, so that the player
+//!   shows a loading state for as long as nothing comes, and gets `503`
+//!   when the swarm sends nothing in time (before its own read timeout).
 //! - `/cover?artist=…&album=…` redirects to the album's front cover on
 //!   Cover Art Archive (see `covers`), or answers `404`.
 //! - The port is kept in `<data_dir>/relay-port` and reused, so that cover
@@ -28,7 +31,7 @@ use axum::routing::get;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::covers::Covers;
@@ -149,14 +152,34 @@ async fn serve(
     let body = if method == Method::HEAD || length == 0 {
         Body::empty()
     } else {
-        match reader_at(&engine, &id, index, start).await {
-            Ok(r) => {
-                let read = Reading { engine, id, index, pos: start, end: end + 1, reader: Some(r), failures: 0 };
-                Body::from_stream(stream::unfold(read, next_chunk))
+        // Opening the torrent counts in the wait too: it can take long
+        // (initialising after a restart, another file being added).
+        let first = async {
+            let r = reader_at(&engine, &id, index, start).await?;
+            let serving = Serving::new(&engine);
+            let read = Reading { engine: engine.clone(), id: id.clone(), index, pos: start, end: end + 1, reader: Some(r), failures: 0, _serving: serving };
+            anyhow::Ok(next_chunk(read).await)
+        };
+        match tokio::time::timeout(FIRST_BYTES_WAIT, first).await {
+            Ok(Ok(Some((Ok(first), rest)))) => {
+                Body::from_stream(stream::once(async move { Ok(first) }).chain(stream::unfold(rest, next_chunk)))
             }
-            Err(e) => {
+            Ok(Ok(Some((Err(e), _)))) => {
+                eprintln!("relay: {id}/{index}: {e}");
+                return (StatusCode::SERVICE_UNAVAILABLE, "torrent unavailable").into_response();
+            }
+            Ok(Err(e)) => {
                 eprintln!("relay: {id}/{index}: {e:#}");
                 return (StatusCode::SERVICE_UNAVAILABLE, "torrent unavailable").into_response();
+            }
+            Ok(Ok(None)) => Body::empty(),
+            Err(_) => {
+                let peers = engine.live_peers(&id).map_or("unknown".to_string(), |n| n.to_string());
+                eprintln!(
+                    "relay: {id}/{index}: nothing from the swarm in {} s at byte {start} ({peers} peers connected)",
+                    FIRST_BYTES_WAIT.as_secs()
+                );
+                return (StatusCode::SERVICE_UNAVAILABLE, "no data from the swarm").into_response();
             }
         }
     };
@@ -173,6 +196,9 @@ async fn reader_at(engine: &Engine, id: &str, index: usize, pos: u64) -> anyhow:
     Ok(Box::pin(s))
 }
 
+/// How long a response waits for its first bytes: less than the player's
+/// read timeout (30 s), so that it gets a clear error instead.
+const FIRST_BYTES_WAIT: Duration = Duration::from_secs(25);
 /// Failed reads in a row before the relay gives up on a response.
 const MAX_FAILURES: u32 = 8;
 const CHUNK: u64 = 64 * 1024;
@@ -186,6 +212,25 @@ struct Reading {
     end: u64,
     reader: Option<FileStream>,
     failures: u32,
+    _serving: Serving,
+}
+
+/// Counts the responses being served while it lives: background reads
+/// (the albums' FLAC headers) wait for none to be, so as not to share the
+/// swarm's bandwidth with what plays.
+struct Serving(Arc<Engine>);
+
+impl Serving {
+    fn new(engine: &Arc<Engine>) -> Serving {
+        engine.serving.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Serving(engine.clone())
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.0.serving.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The next bytes of a response. A read that fails (the torrent changing
